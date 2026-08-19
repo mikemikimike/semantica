@@ -65,8 +65,9 @@ Author: Semantica Contributors
 License: MIT
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union, cast
 import concurrent.futures
+import inspect
 
 import numpy as np
 
@@ -76,6 +77,24 @@ from ..utils.progress_tracker import get_progress_tracker
 from ..embeddings import EmbeddingGenerator
 from .hybrid_similarity import HybridSimilarityCalculator
 from .decision_embedding_pipeline import DecisionEmbeddingPipeline
+
+class SearchResult(TypedDict):
+    """Canonical schema returned by VectorStore.search_vectors().
+
+    Required fields (always present):
+        id       – string or integer identifier of the stored vector.
+        score    – float similarity score, higher is better (normalised to 0.0–1.0 across all backends).
+        metadata – dict of associated metadata; empty dict when none is stored.
+        vector   – np.ndarray when the backend returns the raw vector, otherwise None.
+        distance – raw native distance value preserved for backends that expose it
+                   (FAISS L2, Weaviate cosine), otherwise None.
+    """
+
+    id: Union[str, int]
+    score: float
+    metadata: Dict[str, Any]
+    vector: Optional[Any]          # np.ndarray | None
+    distance: Optional[float]
 
 
 class VectorStore:
@@ -113,7 +132,7 @@ class VectorStore:
         self.dimension = self.config.get("dimension", 768)
 
         # Initialize backend-specific store if not using generic in-memory implementation
-        self._backend_store = None
+        self._backend_store: Any = None
         self.embedder = None  # Always initialized; may be overridden in _init_backend_store
         if self.backend != "inmemory":
             self._init_backend_store()
@@ -496,7 +515,15 @@ class VectorStore:
                     # Some stores have store_vectors method
                     return self._backend_store.store_vectors(vectors, metadata=metadata, **options)
                 else:
-                    # Basic add_vectors without metadata
+                    try:
+                        add_vectors_params = inspect.signature(self._backend_store.add_vectors).parameters
+                        supports_metadata = 'metadata' in add_vectors_params or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in add_vectors_params.values()
+                        )
+                    except (ValueError, TypeError):
+                        supports_metadata = True
+                    if supports_metadata:
+                        return self._backend_store.add_vectors(vectors, metadata=metadata, **options)
                     return self._backend_store.add_vectors(vectors, **options)
             else:
                 raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have add or add_vectors method")
@@ -546,27 +573,33 @@ class VectorStore:
         Args:
             path: Directory path to save to
         """
+        import json
         import os
-        import pickle
         
         os.makedirs(path, exist_ok=True)
-        
+
         # Save metadata and vectors (generic fallback)
         # Ideally, backends like FAISS have their own save methods
-        if hasattr(self.indexer, "save_index"):
-             self.indexer.save_index(os.path.join(path, "index.bin"))
-        
-        # Save Python-level data
+        indexer = getattr(self, "indexer", None)
+        if indexer is not None and hasattr(indexer, "save_index"):
+            indexer.save_index(os.path.join(path, "index.bin"))
+        elif self._backend_store is not None and hasattr(self._backend_store, "save_index"):
+            self._backend_store.save_index(os.path.join(path, "index.bin"))
+
+        # Save Python-level data using JSON (safe serialization).
+        # pickle is intentionally avoided to prevent arbitrary code execution
+        # if a malicious .pkl file is placed in the store directory.
         data = {
-            "vectors": self.vectors,
-            "metadata": self.metadata,
+            "vectors": {k: v.tolist() if hasattr(v, "tolist") else list(v)
+                    for k, v in getattr(self, "vectors", {}).items()},
+            "metadata": getattr(self, "metadata", {}),
             "config": self.config,
             "backend": self.backend,
             "dimension": self.dimension
         }
         
-        with open(os.path.join(path, "store_data.pkl"), "wb") as f:
-            pickle.dump(data, f)
+        with open(os.path.join(path, "store_data.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f)
             
         self.logger.info(f"Saved vector store to {path}")
 
@@ -576,17 +609,33 @@ class VectorStore:
         
         Args:
             path: Directory path to load from
+            
+        Raises:
+            RuntimeError: If only a legacy pickle file is found (security risk).
         """
+        import json
         import os
-        import pickle
         
-        data_path = os.path.join(path, "store_data.pkl")
-        if not os.path.exists(data_path):
-            self.logger.warning(f"Store data not found: {data_path}")
+        json_path = os.path.join(path, "store_data.json")
+        legacy_pkl_path = os.path.join(path, "store_data.pkl")
+        
+        if os.path.exists(json_path):
+            data_path = json_path
+        elif os.path.exists(legacy_pkl_path):
+            # Refuse to load pickle files to prevent arbitrary code execution.
+            # A crafted .pkl file can execute arbitrary Python when deserialized.
+            raise RuntimeError(
+                f"Legacy pickle file found at {legacy_pkl_path}. "
+                "Pickle deserialization is disabled for security (arbitrary code "
+                "execution risk). Please re-save the vector store to migrate "
+                "to the safe JSON format: vs.save(path)"
+            )
+        else:
+            self.logger.warning(f"Store data not found in: {path}")
             return
             
-        with open(data_path, "rb") as f:
-            data = pickle.load(f)
+        with open(data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
             
         self.vectors = data.get("vectors", {})
         self.metadata = data.get("metadata", {})
@@ -595,14 +644,21 @@ class VectorStore:
         self.dimension = data.get("dimension", 768)
         
         # Restore backend-specific index
-        if hasattr(self.indexer, "load_index"):
-            index_path = os.path.join(path, "index.bin")
+        indexer = getattr(self, "indexer", None)
+        index_path = os.path.join(path, "index.bin")
+        if indexer is not None and hasattr(indexer, "load_index"):
             if os.path.exists(index_path):
-                self.indexer.load_index(index_path)
+                indexer.load_index(index_path)
             else:
                 # Rebuild if index file missing but vectors present
-                self.indexer.create_index(list(self.vectors.values()), list(self.vectors.keys()))
-        
+                indexer.create_index(list(self.vectors.values()), list(self.vectors.keys()))
+        elif (
+            self._backend_store is not None
+            and hasattr(self._backend_store, "load_index")
+            and os.path.exists(index_path)
+        ):
+            self._backend_store.load_index(index_path)
+
         self.logger.info(f"Loaded vector store from {path}")
 
     def search(self, query: str, limit: int = 10, **options) -> List[Dict[str, Any]]:
@@ -625,7 +681,7 @@ class VectorStore:
 
     def search_vectors(
         self, query_vector: np.ndarray, k: int = 10, **options
-    ) -> List[Dict[str, Any]]:
+    ) -> List[SearchResult]:
         """
         Search for similar vectors.
 
@@ -644,8 +700,13 @@ class VectorStore:
                 return self._backend_store.search(query_vector, top_k=k, **options)
             elif hasattr(self._backend_store, 'search_similar'):
                 return self._backend_store.search_similar(query_vector, k=k, **options)
+            elif hasattr(self._backend_store, 'search_vectors'):
+                # Some stores (QdrantStore, MilvusStore, PineconeStore) name
+                # their count parameter differently (limit vs k), so bind it
+                # positionally rather than guessing the keyword.
+                return self._backend_store.search_vectors(query_vector, k, **options)
             else:
-                raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have search or search_similar method")
+                raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not have search, search_similar, or search_vectors method")
         
         # Use in-memory implementation
         tracking_id = self.progress_tracker.start_tracking(
@@ -673,11 +734,13 @@ class VectorStore:
                 **options,
             )
 
-            # Add metadata to results if available
+            # Add metadata to results; guarantee the key always exists.
             for result in results:
                 vector_id = result.get("id")
                 if vector_id and vector_id in self.metadata:
                     result["metadata"] = self.metadata[vector_id]
+                elif "metadata" not in result:
+                    result["metadata"] = {}
 
             self.progress_tracker.stop_tracking(
                 tracking_id,
@@ -745,11 +808,50 @@ class VectorStore:
 
     def get_vector(self, vector_id: str) -> Optional[np.ndarray]:
         """Get vector by ID."""
-        return self.vectors.get(vector_id)
+        if self.backend == "inmemory":
+            return self.vectors.get(vector_id)
+        elif self._backend_store and hasattr(self._backend_store, "get_vector"):
+            return self._backend_store.get_vector(vector_id)
+        else:
+            raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not implement get_vector")
 
     def get_metadata(self, vector_id: str) -> Optional[Dict[str, Any]]:
         """Get metadata for vector."""
-        return self.metadata.get(vector_id)
+        if self.backend == "inmemory":
+            return self.metadata.get(vector_id)
+        elif self._backend_store and hasattr(self._backend_store, "get_metadata"):
+            return self._backend_store.get_metadata(vector_id)
+        else:
+            raise NotImplementedError(f"Backend store {type(self._backend_store).__name__} does not implement get_metadata")
+
+    def count(self) -> int:
+        """Return the number of vectors in the store, backend-agnostic.
+
+        The inmemory backend counts its local dict; persistent backends
+        delegate to a ``count()`` on the wrapped store when available.
+        Following the get_vector()/get_metadata() precedent (#843) and the
+        NotImplementedError-on-unsupported-capability precedent of
+        _filter_by_metadata() (#848), a persistent backend that cannot
+        report a count raises NotImplementedError so callers can tell
+        "no vectors" apart from "counting not supported" — including when
+        the wrapped backend store is missing entirely (never silently
+        report an uninitialized store as empty).
+        """
+        if self.backend == "inmemory":
+            return len(self.vectors)
+        elif self._backend_store is not None:
+            count_attr = getattr(self._backend_store, "count", None)
+            if callable(count_attr):
+                return cast(int, count_attr())
+            raise NotImplementedError(
+                f"Backend store {type(self._backend_store).__name__} does not "
+                "implement a count() method. Add a count() method to the "
+                "backend store adapter to enable vector counting for this backend."
+            )
+        raise NotImplementedError(
+            f"Backend store is not initialized; cannot count vectors for "
+            f"backend {self.backend!r}."
+        )
 
     def initialize_decision_pipeline(
         self,
@@ -975,16 +1077,23 @@ class VectorStore:
     ) -> Dict[str, Any]:
         """
         Build decision context graph.
-        
+
         Args:
             decision_id: Decision vector ID
             depth: Context depth
             include_entities: Whether to include entities
             include_policies: Whether to include policies
             max_hops: Maximum hops for context expansion
-            
+
         Returns:
-            Decision context graph
+            Decision context graph dict with keys:
+              - decision_id, decision_metadata, entities, policies,
+                related_decisions, context_graph.
+            If the backend cannot retrieve the raw vector for *decision_id*
+            (e.g. a FAISS index built without ``make_direct_map``), similarity
+            enrichment is skipped, a WARNING is emitted, and the key
+            ``similarity_unavailable=True`` is added.  ``related_decisions``
+            remains an empty list for schema stability.
         """
         # Get decision metadata
         decision_metadata = self.get_metadata(decision_id)
@@ -1008,8 +1117,8 @@ class VectorStore:
             context["entities"] = decision_metadata["entities"]
         
         # Add related decisions based on similarity
-        if decision_id in self.vectors:
-            query_vector = self.vectors[decision_id]
+        query_vector = self.get_vector(decision_id)
+        if query_vector is not None:
             similar_decisions = self.search_vectors(query_vector, k=depth * 5)
             
             for result in similar_decisions:
@@ -1019,6 +1128,13 @@ class VectorStore:
                         "similarity": result["score"],
                         "metadata": result.get("metadata", {})
                     })
+        else:
+            self.logger.warning(
+                "Backend cannot retrieve vector for decision '%s' — "
+                "similarity enrichment skipped.",
+                decision_id,
+            )
+            context["similarity_unavailable"] = True
         
         return context
 
@@ -1031,15 +1147,20 @@ class VectorStore:
     ) -> Dict[str, Any]:
         """
         Generate explanation for a decision.
-        
+
         Args:
             decision_id: Decision vector ID
             include_paths: Whether to include reasoning paths
             include_confidence: Whether to include confidence scores
             include_weights: Whether to include similarity weights
-            
+
         Returns:
-            Decision explanation
+            Decision explanation dict.  When *include_paths* is True and the
+            backend can retrieve the raw vector, ``similar_decisions`` is
+            populated.  If the backend cannot retrieve the vector (e.g. a FAISS
+            index without ``make_direct_map``), a WARNING is emitted, the key
+            ``similarity_unavailable=True`` is added, and ``similar_decisions``
+            is set to ``[]`` for schema stability.
         """
         decision_metadata = self.get_metadata(decision_id)
         if not decision_metadata:
@@ -1062,10 +1183,18 @@ class VectorStore:
         
         if include_paths:
             # Find similar decisions for reasoning paths
-            if decision_id in self.vectors:
-                query_vector = self.vectors[decision_id]
+            query_vector = self.get_vector(decision_id)
+            if query_vector is not None:
                 similar_decisions = self.search_vectors(query_vector, k=3)
                 explanation["similar_decisions"] = similar_decisions
+            else:
+                self.logger.warning(
+                    "Backend cannot retrieve vector for decision '%s' — "
+                    "similarity enrichment skipped.",
+                    decision_id,
+                )
+                explanation["similarity_unavailable"] = True
+                explanation["similar_decisions"] = []
         
         return explanation
 
@@ -1085,50 +1214,25 @@ class VectorStore:
             from datetime import datetime, timedelta
             cutoff = datetime.now() - timedelta(days=7)
             filters["timestamp"] = {"min": cutoff.isoformat()}
-        
         return filters
 
     def _filter_by_metadata(self, filters: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
         """Filter decisions by metadata only."""
+        if self._backend_store is not None:
+            if hasattr(self._backend_store, "filter_by_metadata"):
+                return self._backend_store.filter_by_metadata(filters=filters, limit=limit)
+            raise NotImplementedError(
+                f"Backend store {type(self._backend_store).__name__} does not "
+                "implement filter_by_metadata. Metadata-only filtering via "
+                "filter_decisions(query=None, ...) is only supported for backends "
+                "that implement filter_by_metadata. Pass a query string to use search_decisions() "
+                "instead, which is supported by all backends."
+            )
+
         results = []
         
         for vector_id, metadata in self.metadata.items():
-            match = True
-            
-            for key, value in filters.items():
-                if key not in metadata:
-                    match = False
-                    break
-                
-                if isinstance(value, dict):
-                    # Handle range filters
-                    metadata_value = metadata[key]
-                    if "min" in value and metadata_value < value["min"]:
-                        match = False
-                        break
-                    if "max" in value and metadata_value > value["max"]:
-                        match = False
-                        break
-                elif isinstance(value, list):
-                    # Handle list membership
-                    metadata_value = metadata[key]
-                    if isinstance(metadata_value, list):
-                        # Both are lists - check for intersection
-                        if not set(metadata_value) & set(value):
-                            match = False
-                            break
-                    else:
-                        # Metadata value is scalar, check if it's in the filter list
-                        if metadata_value not in value:
-                            match = False
-                            break
-                else:
-                    # Handle exact match
-                    if metadata[key] != value:
-                        match = False
-                        break
-            
-            if match:
+            if _matches_filter(metadata, filters):
                 results.append({
                     "id": vector_id,
                     "metadata": metadata,
@@ -1139,6 +1243,43 @@ class VectorStore:
                     break
         
         return results
+
+
+def _matches_filter(metadata: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+    """Check if metadata dictionary matches filter criteria."""
+    if not filters:
+        return True
+    if metadata is None:
+        return False
+
+    for key, value in filters.items():
+        if key not in metadata:
+            return False
+
+        metadata_value = metadata[key]
+
+        if isinstance(value, dict):
+            # Handle range filters
+            if "min" in value and value["min"] is not None:
+                if metadata_value is None or metadata_value < value["min"]:
+                    return False
+            if "max" in value and value["max"] is not None:
+                if metadata_value is None or metadata_value > value["max"]:
+                    return False
+        elif isinstance(value, list):
+            # Handle list membership
+            if isinstance(metadata_value, list):
+                if not (set(metadata_value) & set(value)):
+                    return False
+            else:
+                if metadata_value not in value:
+                    return False
+        else:
+            # Handle exact match
+            if metadata_value != value:
+                return False
+
+    return True
 
 
 class VectorIndexer:
@@ -1262,6 +1403,8 @@ class VectorRetriever:
                     "id": ids[idx],
                     "vector": vectors[idx],
                     "score": float(similarities[idx]),
+                    "metadata": {},
+                    "distance": None,
                 }
             )
 
@@ -1338,21 +1481,47 @@ class VectorManager:
     def maintain_store(
         self, store: VectorStore, **options: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Maintain vector store health."""
-        # Check integrity
-        vector_count = len(store.vectors)
-        metadata_count = len(store.metadata)
+        """Maintain vector store health.
 
+        For the inmemory backend, both the vector count and the metadata
+        count are independently tracked in separate dicts and are compared
+        as an integrity check.
+
+        For persistent backends that implement ``VectorStore.count()``,
+        only the vector count is available.  Metadata is co-located with
+        each vector in the underlying store (added/deleted atomically),
+        so a separate metadata count cannot be meaningfully distinguished
+        from the vector count.  The response omits ``metadata_count`` for
+        such backends and reports ``healthy: True`` to indicate that the
+        store is reachable and operational.
+
+        If the backend does not implement ``count()``, the ``NotImplementedError``
+        propagates to the caller — it is not silenced.
+        """
+        if store.backend == "inmemory":
+            # Inmemory keeps vectors and metadata in separate dicts; compare
+            # them to detect accidental divergence (#855).
+            vector_count = len(store.vectors)
+            metadata_count = len(store.metadata)
+            return {
+                "healthy": vector_count == metadata_count,
+                "vector_count": vector_count,
+                "metadata_count": metadata_count,
+            }
+
+        # Persistent backend: delegate to count().  Metadata and vectors are
+        # stored together, so only one count is available.
+        vector_count = store.count()
         return {
-            "healthy": vector_count == metadata_count,
+            "healthy": True,
             "vector_count": vector_count,
-            "metadata_count": metadata_count,
+            "metadata_count": None,
         }
 
     def collect_statistics(self, store: VectorStore) -> Dict[str, Any]:
         """Collect vector store statistics."""
         return {
-            "total_vectors": len(store.vectors),
+            "total_vectors": store.count(),
             "dimension": store.dimension,
             "backend": store.backend,
         }

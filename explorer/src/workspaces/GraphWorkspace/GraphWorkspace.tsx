@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import {
   Activity,
   Clock3,
@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Search,
   Users,
+  X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -38,6 +39,8 @@ import {
   type GraphPluginPanelDescriptor,
   type GraphPluginToolbarItem,
 } from "./plugins";
+import { explorationEffectsShouldLoad, neighborhoodPanelShouldLoad, temporalOverlayShouldLoad } from "./pluginRegistryPredicates";
+import { shouldFetchTemporalBounds, shouldFetchTemporalSnapshot } from "./temporalLifecyclePredicates";
 import type { LinkPrediction, PathResponse } from "./GraphInspectorPanel";
 import type { GraphSceneHandle, GraphSceneRuntime } from "./scene";
 import type {
@@ -126,7 +129,7 @@ type LazyPluginRegistryEntry = {
   load: () => Promise<GraphPlugin>;
   shouldLoad: (context: {
     panelState: Record<string, boolean>;
-    temporalState: GraphTemporalState | null;
+    temporalState?: GraphTemporalState | null;
   }) => boolean;
 };
 
@@ -145,6 +148,7 @@ const DEFAULT_EFFECTS_STATE: GraphEffectsState = {
   communitiesEnabled: false,
   centralityEnabled: false,
   legendEnabled: false,
+  edgeLabelsEnabled: true,
   diagnosticsEnabled: false,
   lensMode: "neighborhood",
   effectQuality: "bounded",
@@ -281,37 +285,168 @@ function SegmentedModeControl({ items }: { items: GraphToolbarItem[] }) {
   );
 }
 
+const SUGGESTION_DEBOUNCE_MS = 250;
+const SUGGESTION_LIMIT = 6;
+
 function SearchCommandBar({
   value,
   disabled,
   onChange,
   onSubmit,
+  onSelectSuggestion,
 }: {
   value: string;
   disabled: boolean;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onSelectSuggestion: (result: SearchResult) => void;
 }) {
+  const [suggestions, setSuggestions] = useState<SearchResult[]>([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [highlightedIndex, setHighlightedIndex] = useState(-1);
+  const abortRef = useRef<AbortController | null>(null);
+  const debounceRef = useRef<number | null>(null);
+  const listboxId = useId();
+
+  useEffect(() => {
+    if (debounceRef.current !== null) {
+      window.clearTimeout(debounceRef.current);
+    }
+
+    const query = value.trim();
+    if (disabled || !query) {
+      abortRef.current?.abort();
+      setSuggestions([]);
+      setSuggestionsOpen(false);
+      setHighlightedIndex(-1);
+      return;
+    }
+
+    debounceRef.current = window.setTimeout(() => {
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      fetch("/api/graph/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, limit: SUGGESTION_LIMIT }),
+        signal: controller.signal,
+      })
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(`Search failed with status ${response.status}`);
+          }
+          return response.json();
+        })
+        .then((data: { results?: SearchResult[] }) => {
+          setSuggestions(data.results ?? []);
+          setSuggestionsOpen(true);
+          setHighlightedIndex(-1);
+        })
+        .catch((suggestionError: unknown) => {
+          if (suggestionError instanceof DOMException && suggestionError.name === "AbortError") {
+            return;
+          }
+          setSuggestions([]);
+          setSuggestionsOpen(false);
+          setHighlightedIndex(-1);
+        });
+    }, SUGGESTION_DEBOUNCE_MS);
+
+    return () => {
+      if (debounceRef.current !== null) {
+        window.clearTimeout(debounceRef.current);
+      }
+      abortRef.current?.abort();
+    };
+  }, [value, disabled]);
+
+  const closeSuggestions = () => {
+    setSuggestionsOpen(false);
+    setHighlightedIndex(-1);
+  };
+
+  const selectSuggestion = (result: SearchResult) => {
+    setSuggestions([]);
+    closeSuggestions();
+    onSelectSuggestion(result);
+  };
+
   return (
     <form
       className="explore-search-command"
+      role="combobox"
+      aria-expanded={suggestionsOpen && suggestions.length > 0}
+      aria-haspopup="listbox"
+      aria-owns={listboxId}
       onSubmit={(event) => {
         event.preventDefault();
-        if (!disabled) {
-          onSubmit();
+        if (disabled) return;
+        if (suggestionsOpen && highlightedIndex >= 0 && suggestions[highlightedIndex]) {
+          selectSuggestion(suggestions[highlightedIndex]);
+          return;
         }
+        closeSuggestions();
+        onSubmit();
       }}
     >
       <Search size={17} strokeWidth={2.15} aria-hidden />
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
+        onFocus={() => {
+          if (suggestions.length > 0) {
+            setSuggestionsOpen(true);
+          }
+        }}
+        onBlur={() => {
+          window.setTimeout(closeSuggestions, 120);
+        }}
+        onKeyDown={(event) => {
+          if (!suggestionsOpen || suggestions.length === 0) return;
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setHighlightedIndex((current) => (current + 1) % suggestions.length);
+          } else if (event.key === "ArrowUp") {
+            event.preventDefault();
+            setHighlightedIndex((current) => (current <= 0 ? suggestions.length - 1 : current - 1));
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            closeSuggestions();
+          }
+        }}
         placeholder="Search command, node, or concept"
         aria-label="Search graph nodes"
+        aria-autocomplete="list"
+        aria-controls={listboxId}
+        aria-activedescendant={highlightedIndex >= 0 ? `${listboxId}-${highlightedIndex}` : undefined}
       />
       <button type="submit" disabled={disabled} aria-label="Search for the current query">
         Search
       </button>
+
+      {suggestionsOpen && suggestions.length > 0 ? (
+        <ul id={listboxId} role="listbox" className="explore-search-suggestions" aria-label="Search suggestions">
+          {suggestions.map((result, index) => (
+            <li
+              key={result.node.id}
+              id={`${listboxId}-${index}`}
+              role="option"
+              aria-selected={index === highlightedIndex}
+              data-highlighted={index === highlightedIndex}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                selectSuggestion(result);
+              }}
+              onMouseEnter={() => setHighlightedIndex(index)}
+            >
+              <span className="explore-search-suggestion-label">{result.node.content || result.node.id}</span>
+              <span className="explore-search-suggestion-type">{result.node.type}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </form>
   );
 }
@@ -576,6 +711,7 @@ const HUD_CSS = `
     gap: 10px;
   }
   .explore-search-command {
+    position: relative;
     min-width: 0;
     height: 43px;
     display: grid;
@@ -590,6 +726,50 @@ const HUD_CSS = `
       ${GRAPH_THEME.ui.control.inputBg};
     color: ${GRAPH_THEME.ui.text.muted};
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.045), 0 14px 30px rgba(0,0,0,0.16);
+  }
+  .explore-search-suggestions {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    z-index: 30;
+    margin: 0;
+    padding: 6px;
+    list-style: none;
+    max-height: 288px;
+    overflow-y: auto;
+    border-radius: 14px;
+    border: 1px solid ${GRAPH_THEME.ui.control.inputBorder};
+    background: ${GRAPH_THEME.ui.surface.cardStrong};
+    box-shadow: 0 18px 40px rgba(0,0,0,0.32), inset 0 1px 0 rgba(255,255,255,0.04);
+  }
+  .explore-search-suggestions li {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    cursor: pointer;
+    color: ${GRAPH_THEME.ui.text.body};
+  }
+  .explore-search-suggestions li[data-highlighted="true"] {
+    background: ${GRAPH_THEME.ui.control.hoverBg};
+  }
+  .explore-search-suggestion-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .explore-search-suggestion-type {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: ${GRAPH_THEME.ui.text.subtle};
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
   .explore-search-command:focus-within {
     border-color: ${GRAPH_THEME.ui.control.activeBorder};
@@ -1119,6 +1299,18 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
   const [activeNodeCount, setActiveNodeCount] = useState<number | null>(null);
   const [temporalBounds, setTemporalBounds] = useState<TemporalBounds | null>(null);
   const [scrubberTime, setScrubberTime] = useState<Date | null>(null);
+  // Deduplicates setScrubberTime calls by millisecond value so that React 18
+  // concurrent-mode re-renders with a new Date object for the same timestamp
+  // do not churn temporalState and retrigger the diagnostics effect (issue #830).
+  const lastScrubberMsRef = useRef<number | null>(null);
+  const onTimeChange = useCallback((time: Date) => {
+    const ms = time.getTime();
+    if (ms === lastScrubberMsRef.current) {
+      return;
+    }
+    lastScrubberMsRef.current = ms;
+    setScrubberTime(time);
+  }, []);
   const [loadingProgress, setLoadingProgress] = useState<GraphLoadProgress | null>(null);
   const [pluginPanelState, setPluginPanelState] = useState<Record<string, boolean>>({
     "effects-panel": false,
@@ -1129,6 +1321,9 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
   const [pluginRuntimeVersion, setPluginRuntimeVersion] = useState(0);
   const [effectsState, setEffectsState] = useState<GraphEffectsState>(DEFAULT_EFFECTS_STATE);
   const [graphDiagnosticsState, setGraphDiagnosticsState] = useState<GraphRuntimeDiagnosticsSnapshot | null>(null);
+  // Tracks the last accepted diagnostics outside React's state cycle, allowing
+  // handleDiagnosticsChange to compare synchronously before calling setState.
+  const lastDiagnosticsRef = useRef<GraphRuntimeDiagnosticsSnapshot | null>(null);
   const [graphAnalyticsState, setGraphAnalyticsState] = useState<GraphAnalyticsSnapshot | null>(null);
   const [loadedPlugins, setLoadedPlugins] = useState<Record<string, GraphPlugin>>({});
 
@@ -1209,11 +1404,27 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     }));
   }, []);
 
-  const { data: summary, isLoading, isFetching } = useLoadGraph({
+  const {
+    data: summary,
+    isLoading,
+    isFetching,
+    isError: isGraphLoadError,
+    error: graphLoadError,
+    refetch: refetchGraph,
+  } = useLoadGraph({
     enabled: true,
     onGraphReady: applyGraphReadySummary,
     onProgress: handleLoadProgress,
   });
+
+  const graphLoadErrorMessage = isGraphLoadError
+    ? (graphLoadError instanceof Error ? graphLoadError.message : "Unknown error while loading the graph.")
+    : null;
+
+  const handleRetryGraphLoad = useCallback(() => {
+    setLoadingProgress(null);
+    void refetchGraph();
+  }, [refetchGraph]);
 
   useEffect(() => {
     if (isLayoutRunning) {
@@ -1231,7 +1442,18 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     applyGraphReadySummary(summary);
   }, [applyGraphReadySummary, graphReady, summary]);
 
+  const canFetchTemporalBounds = shouldFetchTemporalBounds(summary);
+  const canFetchTemporalSnapshot = shouldFetchTemporalSnapshot({
+    debouncedTime,
+    isLoading,
+    summary,
+  });
+
   useEffect(() => {
+    if (!canFetchTemporalBounds) {
+      return;
+    }
+
     let cancelled = false;
     const loadBounds = async () => {
       try {
@@ -1251,10 +1473,21 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     return () => {
       cancelled = true;
     };
-  }, [summary?.nodeCount, summary?.edgeCount]);
+  }, [
+    canFetchTemporalBounds,
+    summary?.nodeCount,
+    summary?.edgeCount,
+  ]);
 
   useEffect(() => {
-    if (!debouncedTime || isLoading) return;
+    if (!canFetchTemporalSnapshot) {
+      return;
+    }
+
+    if (!debouncedTime) {
+      return;
+    }
+
     let cancelled = false;
 
     const applySnapshot = async () => {
@@ -1296,7 +1529,10 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     return () => {
       cancelled = true;
     };
-  }, [debouncedTime, isLoading]);
+  }, [
+    canFetchTemporalSnapshot,
+    debouncedTime,
+  ]);
 
   const resolveNodeIdForFocusedMode = useCallback((
     nodeId: string,
@@ -1506,6 +1742,11 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
       setSearchError(searchFetchError instanceof Error ? searchFetchError.message : "Search failed");
     }
   }, [searchQuery]);
+
+  const handleClearSearchResults = useCallback(() => {
+    setSearchResults([]);
+    setSearchError("");
+  }, []);
 
   const handleRunPredictions = useCallback(async () => {
     if (!inspectableNodeId) return;
@@ -1885,7 +2126,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     viewMode,
   ]);
 
-  const showLoadingOverlay = !graphReady && (isLoading || isFetching || Boolean(loadingProgress));
+  const showLoadingOverlay = !graphReady && (isLoading || isFetching || Boolean(loadingProgress) || isGraphLoadError);
   const showSettlingStatus = graphReady && loadingProgress?.phase === "stabilizing_layout";
   const hasGraphContent = Boolean(summary?.nodeCount);
   const activePath = pathResult?.path ?? EMPTY_PATH;
@@ -2056,7 +2297,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
         title: "Open exploration effects controls",
         order: 18,
         load: loadExplorationEffectsPlugin,
-        shouldLoad: ({ panelState }) => Boolean(panelState["effects-panel"]),
+        shouldLoad: explorationEffectsShouldLoad,
       },
       {
         id: "neighborhood-panel",
@@ -2065,7 +2306,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
         title: "Toggle neighborhood panel",
         order: 30,
         load: loadNeighborhoodPanelPlugin,
-        shouldLoad: ({ panelState }) => Boolean(panelState["neighborhood-panel"]),
+        shouldLoad: neighborhoodPanelShouldLoad,
       },
       {
         id: "temporal-overlay",
@@ -2074,7 +2315,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
         title: "Toggle temporal context panel",
         order: 40,
         load: loadTemporalOverlayPlugin,
-        shouldLoad: ({ panelState, temporalState }) => Boolean(panelState["temporal-panel"] || temporalState?.currentTime),
+        shouldLoad: temporalOverlayShouldLoad,
       },
     ],
     [],
@@ -2092,7 +2333,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
         return;
       }
 
-      if (!entry.shouldLoad({ panelState: pluginPanelState, temporalState })) {
+      if (!entry.shouldLoad({ panelState: pluginPanelState })) {
         return;
       }
 
@@ -2111,7 +2352,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     return () => {
       cancelled = true;
     };
-  }, [loadedPlugins, pluginPanelState, pluginRegistry, temporalState]);
+  }, [loadedPlugins, pluginPanelState, pluginRegistry]);
 
   const setEffectToggle = useCallback((effect: GraphEffectToggle, enabled: boolean | ((current: boolean) => boolean)) => {
     setEffectsState((current) => {
@@ -2274,6 +2515,55 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     if (!GRAPH_THEME.effects.diagnostics.enabledInDev) {
       return;
     }
+
+    // Compare against the last accepted snapshot synchronously before calling
+    // setState. buildEffectAvailability always returns a new object, so an
+    // unconditional setGraphDiagnosticsState on every call created a
+    // render → diagnostics effect → setState → render cycle that exceeded
+    // React's max update depth in dev mode (issue #830).
+    const prev = lastDiagnosticsRef.current;
+    if (prev !== null) {
+      const EFFECT_KEYS = [
+        "pathPulse", "pathFlow", "lens", "temporalEmphasis", "semanticRegions",
+        "contours", "pathfinding", "communities", "centrality", "legend", "diagnostics",
+      ] as const;
+      const prevEA = prev.effectAvailability;
+      const nextEA = diagnostics.effectAvailability;
+      const availabilityChanged = EFFECT_KEYS.some((key) => {
+        const p = prevEA[key];
+        const n = nextEA[key];
+        return (
+          p.enabled !== n.enabled ||
+          p.available !== n.available ||
+          p.reason !== n.reason ||
+          p.detail !== n.detail ||
+          p.visibleSegments !== n.visibleSegments ||
+          p.segmentCap !== n.segmentCap
+        );
+      });
+
+      const edgeClassesChanged =
+        prev.edgeClasses?.updatedAt !== diagnostics.edgeClasses?.updatedAt;
+
+      const structureLayerChanged =
+        prev.structureLayer?.cacheKey !== diagnostics.structureLayer?.cacheKey ||
+        prev.structureLayer?.lastDrawAt !== diagnostics.structureLayer?.lastDrawAt ||
+        prev.structureLayer?.enabled !== diagnostics.structureLayer?.enabled ||
+        prev.structureLayer?.disabledReason !== diagnostics.structureLayer?.disabledReason ||
+        prev.structureLayer?.curveCount !== diagnostics.structureLayer?.curveCount ||
+        prev.structureLayer?.bridgeCurveCount !== diagnostics.structureLayer?.bridgeCurveCount ||
+        prev.structureLayer?.backboneCurveCount !== diagnostics.structureLayer?.backboneCurveCount;
+
+      // distanceVisual is compared by reference: GraphCanvas passes the same
+      // object when distances haven't changed.
+      const distanceVisualChanged = prev.distanceVisual !== diagnostics.distanceVisual;
+
+      if (!availabilityChanged && !edgeClassesChanged && !structureLayerChanged && !distanceVisualChanged) {
+        return;
+      }
+    }
+
+    lastDiagnosticsRef.current = diagnostics;
     setGraphDiagnosticsState(diagnostics);
   }, []);
 
@@ -2699,6 +2989,10 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
                     disabled={searchDisabled}
                     onChange={setSearchQuery}
                     onSubmit={() => void handleSearch()}
+                    onSelectSuggestion={(result) => {
+                      setSearchQuery("");
+                      focusNode(result.node.id);
+                    }}
                   />
                   <SegmentedModeControl items={viewModeItems} />
                   <div className="explore-toolbelt">
@@ -2774,20 +3068,36 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
               {searchError ? <div style={{ color: "#ff7b72", fontSize: 12 }}>{searchError}</div> : null}
 
               {searchResults.length ? (
-                <div className="explore-search-results hud-scrollbar" style={searchResultsStripStyle}>
-                  {searchResults.map((result) => (
-                    <button key={result.node.id} style={predictionCardStyle} onClick={() => focusNode(result.node.id)}>
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ color: "#fff", fontWeight: 600 }}>{result.node.content || result.node.id}</div>
-                          <div style={{ color: "#8b949e", fontSize: 12 }}>{result.node.type}</div>
-                        </div>
-                        <div style={{ color: "#58a6ff", fontSize: 12, whiteSpace: "nowrap" }}>
-                          {result.score.toFixed(3)}
-                        </div>
-                      </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <span style={{ color: "#8b949e", fontSize: 12 }}>
+                      {searchResults.length} result{searchResults.length === 1 ? "" : "s"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleClearSearchResults}
+                      style={{ ...secondaryActionButtonStyle, minHeight: 26, padding: "4px 9px", gap: 5 }}
+                      aria-label="Dismiss search results"
+                    >
+                      <X size={12} strokeWidth={2.4} />
+                      Dismiss
                     </button>
-                  ))}
+                  </div>
+                  <div className="explore-search-results hud-scrollbar" style={searchResultsStripStyle}>
+                    {searchResults.map((result) => (
+                      <button key={result.node.id} style={predictionCardStyle} onClick={() => focusNode(result.node.id)}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ color: "#fff", fontWeight: 600 }}>{result.node.content || result.node.id}</div>
+                            <div style={{ color: "#8b949e", fontSize: 12 }}>{result.node.type}</div>
+                          </div>
+                          <div style={{ color: "#58a6ff", fontSize: 12, whiteSpace: "nowrap" }}>
+                            {Math.round(result.score)}
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               ) : null}
 
@@ -2881,6 +3191,8 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
                     progress={loadingProgress}
                     visible={showLoadingOverlay}
                     showGraphBehind={hasGraphContent || Boolean(loadingProgress?.showGraphBehind)}
+                    error={graphLoadErrorMessage}
+                    onRetry={handleRetryGraphLoad}
                   />
                 </div>
               </div>
@@ -2922,7 +3234,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
               <div className="explore-scene-footer">
                 <Suspense fallback={<div style={timelineFallbackStyle}>Loading timeline…</div>}>
                   <LazyTimelinePanel
-                    onTimeChange={setScrubberTime}
+                    onTimeChange={onTimeChange}
                     minDate={temporalBounds?.min ?? undefined}
                     maxDate={temporalBounds?.max ?? undefined}
                   />

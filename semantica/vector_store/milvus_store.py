@@ -35,6 +35,8 @@ Author: Semantica Contributors
 License: MIT
 """
 
+import math
+import re
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -42,6 +44,45 @@ import numpy as np
 from ..utils.exceptions import ProcessingError, ValidationError
 from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
+
+
+def _validate_milvus_key(key: str) -> str:
+    """Validate and escape a metadata filter key for Milvus queries."""
+    if not key or not isinstance(key, str) or not re.match(r"^[a-zA-Z0-9_.-]+$", key):
+        raise ValidationError(f"Invalid metadata filter key: '{key}'")
+    return key.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _format_milvus_value(val: Any) -> str:
+    """Format and escape a filter value for Milvus expression syntax."""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    elif isinstance(val, (int, float)):
+        if isinstance(val, float) and not math.isfinite(val):
+            raise ValidationError(
+                f"Invalid metadata filter value: {val!r}. NaN/Infinity are not "
+                "valid Milvus expression literals."
+            )
+        return str(val)
+    elif isinstance(val, str):
+        escaped = (
+            val.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        )
+        return f'"{escaped}"'
+    elif val is None:
+        return "null"
+    else:
+        escaped = (
+            str(val)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        )
+        return f'"{escaped}"'
 
 # Optional Milvus import
 try:
@@ -162,9 +203,13 @@ class MilvusCollection:
                         {
                             "id": hit.id,
                             "distance": hit.distance,
-                            "score": 1.0 - hit.distance
-                            if hit.distance <= 1.0
-                            else 1.0 / (1.0 + hit.distance),
+                            "score": 1.0 / (1.0 + max(0.0, hit.distance)),
+                            # Milvus collection schema stores only id+vector; no
+                            # metadata field is defined in create_collection().
+                            # Return empty dict — a future schema migration that
+                            # adds a metadata JSON field is tracked separately.
+                            "metadata": {},
+                            "vector": None,
                         }
                     )
                 results.append(batch_results)
@@ -342,9 +387,10 @@ class MilvusStore:
             # Define schema
             fields = [
                 FieldSchema(
-                    name="id", dtype=DataType.INT64, is_primary=True, auto_id=True
+                    name="id", dtype=DataType.VARCHAR, is_primary=True, auto_id=False, max_length=65535
                 ),
                 FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
+                FieldSchema(name="metadata", dtype=DataType.JSON),
             ]
 
             schema = CollectionSchema(
@@ -398,18 +444,28 @@ class MilvusStore:
         except Exception as e:
             raise ProcessingError(f"Failed to get collection: {str(e)}")
 
-    def insert_vectors(
-        self, vectors: List[Union[np.ndarray, List[float]]], **options
-    ) -> Any:
+    def insert_vectors(self, vectors: List[Union[np.ndarray, List[float]]], **options) -> Any:
+        """Backward compatibility alias for add_vectors."""
+        return self.add_vectors(vectors, **options)
+
+    def add_vectors(
+        self, 
+        vectors: List[Union[np.ndarray, List[float]]], 
+        ids: Optional[List[str]] = None,
+        metadata: Optional[List[Dict[str, Any]]] = None,
+        **options
+    ) -> List[str]:
         """
-        Insert vectors into collection.
+        Add vectors to collection.
 
         Args:
             vectors: List of vectors
+            ids: Optional list of vector IDs
+            metadata: Optional list of metadata dictionaries
             **options: Additional options
 
         Returns:
-            Insert result
+            List of vector IDs
         """
         tracking_id = self.progress_tracker.start_tracking(
             module="vector_store",
@@ -442,7 +498,15 @@ class MilvusStore:
                     vector = vector.tolist()
                 vector_data.append(vector)
 
-            data = [vector_data]
+            import uuid
+            if ids is None:
+                ids = [str(uuid.uuid4()) for _ in range(len(vectors))]
+                
+            if metadata is None:
+                metadata = [{} for _ in range(len(vectors))]
+
+            data = [ids, vector_data, metadata]
+            
             self.progress_tracker.update_tracking(
                 tracking_id, message="Inserting vectors into collection..."
             )
@@ -453,7 +517,7 @@ class MilvusStore:
                 status="completed",
                 message=f"Inserted {len(vectors)} vectors",
             )
-            return result
+            return ids
 
         except Exception as e:
             self.progress_tracker.stop_tracking(
@@ -522,6 +586,99 @@ class MilvusStore:
                 tracking_id, status="failed", message=str(e)
             )
             raise
+
+    def get_vector(self, vector_id: str) -> Optional[np.ndarray]:
+        """Get vector by ID."""
+        if not MILVUS_AVAILABLE or not self.collection:
+            return None
+
+        try:
+            safe_id = vector_id.replace("\\", "\\\\").replace('"', '\\"')
+            res = self.collection.collection.query(
+                expr=f'id == "{safe_id}"',
+                output_fields=["vector"]
+            )
+            if res and len(res) > 0:
+                return np.array(res[0]["vector"])
+            return None
+        except Exception:
+            return None
+
+    def get_metadata(self, vector_id: str) -> Optional[Dict[str, Any]]:
+        """Get metadata by ID."""
+        if not MILVUS_AVAILABLE or not self.collection:
+            return None
+
+        try:
+            safe_id = vector_id.replace("\\", "\\\\").replace('"', '\\"')
+            res = self.collection.collection.query(
+                expr=f'id == "{safe_id}"',
+                output_fields=["metadata"]
+            )
+            if res and len(res) > 0:
+                return res[0].get("metadata", {})
+            return None
+        except Exception:
+            return None
+
+    def filter_by_metadata(
+        self, filters: Dict[str, Any], limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter vectors by metadata using Milvus expression filtering.
+
+        Args:
+            filters: Metadata filter criteria
+            limit: Maximum number of results
+
+        Returns:
+            List of matching result dicts with 'id', 'metadata', and 'vector'
+        """
+        if self.collection is None or not MILVUS_AVAILABLE:
+            return []
+
+        expr_parts = []
+        if filters:
+            for key, value in filters.items():
+                safe_key = _validate_milvus_key(key)
+                if isinstance(value, dict):
+                    if "min" in value and value["min"] is not None:
+                        min_val = _format_milvus_value(value["min"])
+                        expr_parts.append(f'metadata["{safe_key}"] >= {min_val}')
+                    if "max" in value and value["max"] is not None:
+                        max_val = _format_milvus_value(value["max"])
+                        expr_parts.append(f'metadata["{safe_key}"] <= {max_val}')
+                elif isinstance(value, list):
+                    formatted_vals = [_format_milvus_value(v) for v in value]
+                    expr_parts.append(
+                        f'metadata["{safe_key}"] in [{", ".join(formatted_vals)}]'
+                    )
+                else:
+                    formatted_val = _format_milvus_value(value)
+                    expr_parts.append(f'metadata["{safe_key}"] == {formatted_val}')
+
+        expr = " and ".join(expr_parts) if expr_parts else "id != ''"
+
+        try:
+            query_results = self.collection.collection.query(
+                expr=expr,
+                limit=limit,
+                output_fields=["id", "vector", "metadata"],
+            )
+            results = []
+            for item in query_results:
+                vec = item.get("vector")
+                results.append(
+                    {
+                        "id": str(item.get("id")),
+                        "metadata": item.get("metadata") or {},
+                        "vector": np.array(vec) if vec is not None else None,
+                    }
+                )
+            return results
+        except Exception as e:
+            self.logger.warning(f"Failed to query Milvus vectors by metadata expression: {e}")
+            return []
 
     def get_stats(self, collection_name: Optional[str] = None) -> Dict[str, Any]:
         """Get collection statistics."""
